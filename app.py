@@ -3,7 +3,7 @@ import uuid
 from pathlib import Path
 from typing import List, Optional
 
-import lance
+import lancedb
 import pyarrow as pa
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
@@ -19,13 +19,15 @@ LANCE_DB_PATH = os.getenv("LANCE_DB_PATH", "./lance_data")
 MODEL_NAME = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "50"))
+TABLE_NAME = "documents"
 
 # Initialize embedding model
 embedding_model = SentenceTransformer(MODEL_NAME)
 EMBEDDING_DIM = embedding_model.get_sentence_embedding_dimension()
 
-# Lance dataset reference
-dataset: Optional[lance.Dataset] = None
+# LanceDB connection and table reference
+db = None
+table = None
 
 
 class SearchRequest(BaseModel):
@@ -74,21 +76,19 @@ def extract_text_from_pdf(file_path: str) -> List[dict]:
 
 
 def initialize_dataset():
-    """Initialize or load the Lance dataset."""
-    global dataset
+    """Initialize or load the LanceDB connection."""
+    global db, table
     
     Path(LANCE_DB_PATH).mkdir(parents=True, exist_ok=True)
-    dataset_path = Path(LANCE_DB_PATH) / "documents"
+    db = lancedb.connect(LANCE_DB_PATH)
     
-    if dataset_path.exists():
-        try:
-            dataset = lance.dataset(str(dataset_path))
-            print(f"Loaded existing dataset with {len(dataset)} records")
-        except Exception as e:
-            print(f"Error loading dataset: {e}")
-            dataset = None
-    else:
-        dataset = None
+    # Check if table exists
+    try:
+        table = db.open_table(TABLE_NAME)
+        print(f"Loaded existing table with {len(table)} records")
+    except Exception:
+        table = None
+        print("No existing table found, will create on first upload")
 
 
 @app.on_event("startup")
@@ -101,7 +101,7 @@ async def startup_event():
 @app.get("/")
 async def root():
     """Health check endpoint."""
-    record_count = len(dataset) if dataset else 0
+    record_count = len(table) if table else 0
     return {
         "status": "healthy",
         "service": "Lance Vector DB - PDF Search",
@@ -114,7 +114,7 @@ async def root():
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
     """Upload and index a PDF document."""
-    global dataset
+    global db, table
     
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
@@ -136,42 +136,31 @@ async def upload_pdf(file: UploadFile = File(...)):
         texts = [chunk["text"] for chunk in chunks_with_metadata]
         embeddings = embedding_model.encode(texts, show_progress_bar=False)
         
-        # Prepare data for Lance
-        data = {
-            "id": [str(uuid.uuid4()) for _ in chunks_with_metadata],
-            "text": texts,
-            "document_name": [file.filename] * len(chunks_with_metadata),
-            "page_number": [chunk["page_number"] for chunk in chunks_with_metadata],
-            "vector": embeddings.tolist(),
-        }
+        # Prepare data for LanceDB
+        data = []
+        for i, chunk in enumerate(chunks_with_metadata):
+            data.append({
+                "id": str(uuid.uuid4()),
+                "text": chunk["text"],
+                "document_name": file.filename,
+                "page_number": chunk["page_number"],
+                "vector": embeddings[i].tolist(),
+            })
         
-        # Create PyArrow table
-        schema = pa.schema([
-            pa.field("id", pa.string()),
-            pa.field("text", pa.string()),
-            pa.field("document_name", pa.string()),
-            pa.field("page_number", pa.int32()),
-            pa.field("vector", pa.list_(pa.float32(), EMBEDDING_DIM)),
-        ])
-        table = pa.Table.from_pydict(data, schema=schema)
-        
-        # Write to Lance dataset
-        dataset_path = Path(LANCE_DB_PATH) / "documents"
-        if dataset is None:
-            # Create new dataset
-            lance.write_dataset(table, str(dataset_path), mode="create")
-            dataset = lance.dataset(str(dataset_path))
+        # Write to LanceDB table
+        if table is None:
+            # Create new table
+            table = db.create_table(TABLE_NAME, data=data)
         else:
-            # Append to existing dataset
-            lance.write_dataset(table, str(dataset_path), mode="append")
-            dataset = lance.dataset(str(dataset_path))
+            # Append to existing table
+            table.add(data)
         
         return JSONResponse(
             status_code=200,
             content={
                 "message": f"Successfully uploaded and indexed {file.filename}",
                 "chunks_added": len(chunks_with_metadata),
-                "total_records": len(dataset)
+                "total_records": len(table)
             }
         )
     
@@ -187,9 +176,9 @@ async def upload_pdf(file: UploadFile = File(...)):
 @app.post("/search", response_model=List[SearchResult])
 async def search(request: SearchRequest):
     """Search for semantically similar text chunks."""
-    global dataset
+    global table
     
-    if dataset is None:
+    if table is None:
         raise HTTPException(status_code=400, detail="No documents have been indexed yet")
     
     try:
@@ -197,20 +186,16 @@ async def search(request: SearchRequest):
         query_embedding = embedding_model.encode([request.query], show_progress_bar=False)[0]
         
         # Perform vector search
-        results = (
-            dataset.scanner(nearest={"column": "vector", "q": query_embedding.tolist(), "k": request.top_k})
-            .to_table()
-            .to_pydict()
-        )
+        results = table.search(query_embedding.tolist()).limit(request.top_k).to_list()
         
         # Format results
         search_results = []
-        for i in range(len(results["text"])):
+        for result in results:
             search_results.append(SearchResult(
-                text=results["text"][i],
-                document_name=results["document_name"][i],
-                page_number=results["page_number"][i],
-                score=float(results.get("_distance", [0])[i]) if "_distance" in results else 0.0
+                text=result["text"],
+                document_name=result["document_name"],
+                page_number=result["page_number"],
+                score=float(result.get("_distance", 0.0))
             ))
         
         return search_results
@@ -222,14 +207,12 @@ async def search(request: SearchRequest):
 @app.delete("/reset")
 async def reset_database():
     """Delete all indexed documents."""
-    global dataset
+    global db, table
     
     try:
-        dataset_path = Path(LANCE_DB_PATH) / "documents"
-        if dataset_path.exists():
-            import shutil
-            shutil.rmtree(dataset_path)
-            dataset = None
+        if table is not None:
+            db.drop_table(TABLE_NAME)
+            table = None
             return {"message": "Database reset successfully"}
         else:
             return {"message": "No database to reset"}
